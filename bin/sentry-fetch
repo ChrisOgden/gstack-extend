@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""
+Fetch a Sentry issue and print a formatted summary.
+
+Usage:
+  sentry-fetch <issue_id>       Fetch an issue (needs config)
+  sentry-fetch --init-project   Create .claude/sentry.json stub in cwd
+  sentry-fetch --init-global    Create ~/.claude/sentry.json stub
+
+Config is read from .claude/sentry.json (project, preferred) then
+~/.claude/sentry.json (global fallback). Format:
+  { "org": "your-sentry-org-slug", "token": "sntrys_..." }
+
+Create a token at Sentry > Settings > Auth Tokens (scope: event:read).
+
+Exit codes:
+  0  success
+  1  network / API / JSON-parse error
+  2  usage error
+  3  no config file found (neither project nor global)
+  4  config found but placeholder values (edit the file)
+"""
+import json
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+STUB = {
+    "org": "your-sentry-org-slug",
+    "token": "sntrys_...",
+}
+
+
+def die(msg, code=1):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def usage(code=2):
+    print(__doc__.strip(), file=sys.stderr)
+    sys.exit(code)
+
+
+def project_cfg_path():
+    return Path(".claude/sentry.json")
+
+
+def global_cfg_path():
+    return Path.home() / ".claude" / "sentry.json"
+
+
+def is_placeholder(token: str) -> bool:
+    if not token:
+        return True
+    if token.startswith("<") or token.endswith(">"):
+        return True
+    if token in ("sntrys_...", "REPLACE_ME", "TODO"):
+        return True
+    return False
+
+
+def load_config():
+    """Return (path, cfg) from project-level then global, or (None, None)."""
+    for path in (project_cfg_path(), global_cfg_path()):
+        if path.exists():
+            try:
+                return path, json.loads(path.read_text())
+            except json.JSONDecodeError as e:
+                die(f"{path} is not valid JSON: {e}")
+    return None, None
+
+
+def in_git_repo() -> bool:
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return r.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def is_gitignored(rel_path: str) -> bool:
+    try:
+        r = subprocess.run(
+            ["git", "check-ignore", "--quiet", rel_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return r.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def ensure_gitignored(rel_path: str):
+    if not in_git_repo():
+        return
+    if is_gitignored(rel_path):
+        return
+    gi = Path(".gitignore")
+    line = rel_path + "\n"
+    if gi.exists():
+        content = gi.read_text()
+        if content and not content.endswith("\n"):
+            content += "\n"
+        gi.write_text(content + line)
+    else:
+        gi.write_text(line)
+    print(f"Added {rel_path} to .gitignore.", file=sys.stderr)
+
+
+def init_stub(path: Path, add_gitignore: bool):
+    if path.exists():
+        die(f"{path} already exists — not overwriting.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(STUB, indent=2) + "\n")
+    path.chmod(0o600)
+    print(f"Created {path} (permissions 0600).", file=sys.stderr)
+    if add_gitignore:
+        ensure_gitignored(str(path))
+    print(
+        f"Edit {path} and replace the placeholder values with your real Sentry "
+        f"org slug and an auth token (Sentry > Settings > Auth Tokens, scope: "
+        f"event:read), then re-run the sentry command.",
+        file=sys.stderr,
+    )
+
+
+def fetch_summary(cfg, issue):
+    org = (cfg.get("org") or "").strip()
+    token = (cfg.get("token") or "").strip()
+    if not org or is_placeholder(token):
+        return None  # caller handles exit 4
+
+    base = f"https://sentry.io/api/0/organizations/{org}/issues/{issue}"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    def fetch(url):
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req) as r:
+            return json.loads(r.read())
+
+    try:
+        issue_data = fetch(f"{base}/")
+        event = fetch(f"{base}/events/latest/")
+    except urllib.error.HTTPError as e:
+        die(f"Sentry API returned {e.code} {e.reason} for issue {issue!r}")
+    except urllib.error.URLError as e:
+        die(f"Network error contacting Sentry: {e.reason}")
+
+    return issue_data, event
+
+
+def print_summary(issue_data, event):
+    # --- Issue summary ---
+    print("=== Issue ===")
+    for k in ["title", "culprit", "status", "level", "count", "userCount",
+              "firstSeen", "lastSeen", "permalink"]:
+        print(f"  {k}: {issue_data.get(k)}")
+
+    # --- Tags ---
+    print("\n=== Tags ===")
+    tag_map = {t["key"]: t["value"] for t in event.get("tags", [])}
+    for k in ["environment", "release", "browser", "browser.name", "os",
+              "os.name", "transaction", "url", "handled"]:
+        if k in tag_map:
+            print(f"  {k}: {tag_map[k]}")
+
+    # --- Entries ---
+    for entry in event.get("entries", []):
+        if entry["type"] == "exception":
+            for val in entry["data"]["values"]:
+                print(f'\n=== Exception: {val["type"]} ===')
+                print(f'Message: {val["value"]}')
+                mech = val.get("mechanism", {})
+                print(f'Mechanism: {mech.get("type", "N/A")} '
+                      f'(handled: {mech.get("handled", "N/A")})')
+                if val.get("stacktrace"):
+                    frames = val["stacktrace"]["frames"]
+                    print(f"\nStacktrace ({len(frames)} frames, bottom = most recent):")
+                    for i, fr in enumerate(frames):
+                        app = " [IN APP]" if fr.get("inApp") else ""
+                        print(f'  #{i}: {fr.get("function", "<unknown>")} '
+                              f'at {fr.get("filename", "?")}:'
+                              f'{fr.get("lineNo", "?")}:{fr.get("colNo", "?")}{app}')
+                        for ctx in (fr.get("context") or []):
+                            print(f"         {ctx[0]}: {ctx[1]}")
+        elif entry["type"] == "request":
+            req = entry["data"]
+            print("\n=== Request ===")
+            print(f'URL: {req.get("url", "N/A")}')
+            print(f'Method: {req.get("method", "N/A")}')
+            for h in (req.get("headers") or []):
+                print(f"  {h[0]}: {h[1]}")
+        elif entry["type"] == "breadcrumbs":
+            crumbs = entry["data"].get("values", [])
+            print(f"\n=== Breadcrumbs (last 10 of {len(crumbs)}) ===")
+            for c in crumbs[-10:]:
+                print(f'  [{c.get("timestamp", "")}] {c.get("category", "")}: '
+                      f'{c.get("message", c.get("data", ""))}')
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        usage()
+
+    if args == ["--init-project"]:
+        init_stub(project_cfg_path(), add_gitignore=True)
+        sys.exit(0)
+    if args == ["--init-global"]:
+        init_stub(global_cfg_path(), add_gitignore=False)
+        sys.exit(0)
+    if args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        sys.exit(0)
+    if len(args) != 1 or args[0].startswith("--"):
+        usage()
+
+    issue = args[0]
+
+    cfg_path, cfg = load_config()
+    if cfg is None:
+        die(
+            "No Sentry config found. Run `sentry-fetch --init-project` "
+            "(this project only) or `sentry-fetch --init-global` (all projects) "
+            "to create a stub config file.",
+            code=3,
+        )
+
+    result = fetch_summary(cfg, issue)
+    if result is None:
+        die(
+            f"{cfg_path} is missing a real org slug or token (placeholder detected). "
+            f"Edit the file with your real Sentry org slug and an auth token "
+            f"(Sentry > Settings > Auth Tokens, scope: event:read), then re-run.",
+            code=4,
+        )
+
+    print_summary(*result)
+
+
+if __name__ == "__main__":
+    main()
