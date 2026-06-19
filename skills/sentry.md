@@ -1,26 +1,44 @@
 ---
-description: Look up a Sentry issue by ID and display error details with stacktrace
-argument: issue_id - The Sentry issue ID (numeric) or short ID (e.g. DRIVETIME-API-3A)
+description: Look up a Sentry issue by ID, or mark one as resolved
+argument: "[resolve] <issue_id> - issue id alone fetches; prefix `resolve` to mark resolved"
 ---
 
-Look up Sentry issue `$ARGUMENTS` and display the error details.
+Operate on Sentry issue `$ARGUMENTS`. Two subcommands:
+
+- `<issue_id>` — fetch and display the issue (default)
+- `resolve <issue_id>` — mark the issue as resolved
 
 ## Steps
 
-1. Run the fetch script. It resolves this repo via the skill's symlink, reads
-   `.claude/sentry.json` (project-level, preferred) or `~/.claude/sentry.json`
-   (global fallback), fetches the issue, and prints a formatted summary.
+1. Resolve the skill repo from the symlink:
 
    ```bash
    _SKILL_SRC=$(readlink ~/.claude/skills/sentry/SKILL.md)
    _REPO=$(dirname "$(dirname "$_SKILL_SRC")")
-   "$_REPO/bin/sentry-fetch" "$ARGUMENTS"
    ```
 
-2. Handle the script's exit code:
+2. Dispatch on the first argument:
 
-   - **0 (success)** — present the summary, then suggest what code might need
-     fixing based on the stacktrace, referencing actual files in the codebase.
+   - If `$ARGUMENTS` starts with the literal word `resolve`, run the resolve
+     script with the issue id that follows:
+
+     ```bash
+     "$_REPO/bin/sentry-resolve" "<issue_id>"
+     ```
+
+   - Otherwise, treat `$ARGUMENTS` as an issue id and run the fetch script:
+
+     ```bash
+     "$_REPO/bin/sentry-fetch" "$ARGUMENTS"
+     ```
+
+3. Handle the script's exit code:
+
+   - **0 (success)** —
+     - For fetch: present the summary, then suggest what code might need
+       fixing based on the stacktrace, referencing actual files in the codebase.
+     - For resolve: confirm the issue is resolved and relay the status line
+       printed by the script.
 
    - **3 (no config)** — ask the user: *"Should I create the stub at
      `.claude/sentry.json` (just this project) or `~/.claude/sentry.json`
@@ -39,5 +57,10 @@ Look up Sentry issue `$ARGUMENTS` and display the error details.
    - **4 (placeholder detected)** — the config exists but still contains
      placeholder values. Relay the script's message; the user needs to edit
      the file it points to.
+
+   - **5 (forbidden — resolve only)** — the token is missing the
+     `event:write` scope. Tell the user to edit the token at
+     Sentry > Settings > Auth Tokens and add `event:write` (fetch only needs
+     `event:read`).
 
    - **Other errors (exit 1)** — relay the script's error (network, API, JSON).
